@@ -1,0 +1,34 @@
+{
+    "name": "BEpusdt 加密货币支付",
+    "code": "bepusdt",
+    "version": "1.0.0",
+    "description": "对接 BEpusdt 加密货币收款网关，支持 USDT/USDC/TRX 等多币种多链收款，动态汇率，自动回调。",
+    "author": "Xboard",
+    "type": "payment",
+    "config": {
+        "api_url": {
+            "type": "string",
+            "default": "",
+            "label": "BEpusdt API 地址",
+            "description": "BEpusdt 网关地址，如 https://pay.example.com"
+        },
+        "api_token": {
+            "type": "string",
+            "default": "",
+            "label": "API Token（对接令牌）",
+            "description": "BEpusdt 后台 → 系统管理 → 基本设置 → API 设置 → 对接令牌"
+        },
+        "trade_type": {
+            "type": "string",
+            "default": "",
+            "label": "交易类型",
+            "description": "指定加密货币类型，如 usdt.trc20。留空则由收银台让用户自选"
+        },
+        "fiat": {
+            "type": "string",
+            "default": "CNY",
+            "label": "法币类型",
+            "description": "可选 CNY、USD、EUR、GBP、JPY"
+        }
+    }
+}
