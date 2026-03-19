@@ -7,6 +7,11 @@ use App\Services\Plugin\AbstractPlugin;
 
 class Plugin extends AbstractPlugin implements PaymentInterface
 {
+    private const MAX_RETRIES       = 3;
+    private const RETRY_BASE_DELAY  = 1;
+    private const DEFAULT_TIMEOUT   = 30;
+    private const CONNECT_TIMEOUT   = 10;
+
     public function boot(): void
     {
         $this->filter('available_payment_methods', function ($methods) {
@@ -47,6 +52,12 @@ class Plugin extends AbstractPlugin implements PaymentInterface
                 'default'     => 'CNY',
                 'description' => 'CNY / USD / EUR / GBP / JPY',
             ],
+            'timeout' => [
+                'label'       => '请求超时（秒）',
+                'type'        => 'string',
+                'default'     => '30',
+                'description' => 'HTTP 请求超时时间，默认 30 秒',
+            ],
         ];
     }
 
@@ -55,15 +66,14 @@ class Plugin extends AbstractPlugin implements PaymentInterface
      */
     public function pay($order): array
     {
-        $apiUrl   = rtrim($this->getConfig('api_url'), '/');
-        $apiToken = $this->getConfig('api_token');
-        $fiat     = $this->getConfig('fiat', 'CNY');
+        $apiUrl    = rtrim($this->getConfig('api_url'), '/');
+        $apiToken  = $this->getConfig('api_token');
+        $fiat      = $this->getConfig('fiat', 'CNY');
         $tradeType = $this->getConfig('trade_type');
+        $timeout   = max(10, (int) $this->getConfig('timeout', self::DEFAULT_TIMEOUT));
 
         $amount = $order['total_amount'] / 100;
 
-        // 如果指定了 trade_type，使用 create-transaction（直接跳收银台）
-        // 否则使用 create-order（让用户自选币种）
         $endpoint = $tradeType ? '/api/v1/order/create-transaction' : '/api/v1/order/create-order';
 
         $params = [
@@ -81,7 +91,7 @@ class Plugin extends AbstractPlugin implements PaymentInterface
 
         $params['signature'] = $this->sign($params, $apiToken);
 
-        $response = $this->httpPost($apiUrl . $endpoint, $params);
+        $response = $this->httpPostWithRetry($apiUrl . $endpoint, $params, $timeout);
 
         if (!$response || ($response['status_code'] ?? 0) !== 200) {
             $msg = $response['message'] ?? '未知错误';
@@ -123,7 +133,6 @@ class Plugin extends AbstractPlugin implements PaymentInterface
             return false;
         }
 
-        // status=2 表示支付成功
         $status = (int) ($params['status'] ?? 0);
         if ($status !== 2) {
             \Log::info('[BEpusdt] 订单状态非成功', ['status' => $status, 'order_id' => $params['order_id'] ?? '']);
@@ -180,29 +189,78 @@ class Plugin extends AbstractPlugin implements PaymentInterface
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  HTTP 请求
+    //  HTTP 请求（带重试 + 指数退避）
     // ═══════════════════════════════════════════════════════════
 
-    private function httpPost(string $url, array $data): ?array
+    private function httpPostWithRetry(string $url, array $data, int $timeout): ?array
+    {
+        $lastError = null;
+
+        for ($attempt = 1; $attempt <= self::MAX_RETRIES; $attempt++) {
+            $startTime = microtime(true);
+            $result    = $this->httpPost($url, $data, $timeout);
+            $elapsed   = round(microtime(true) - $startTime, 2);
+
+            if ($result !== null) {
+                if ($attempt > 1) {
+                    \Log::info('[BEpusdt] 重试成功', [
+                        'attempt' => $attempt,
+                        'elapsed' => "{$elapsed}s",
+                        'url'     => $url,
+                    ]);
+                }
+                return $result;
+            }
+
+            $lastError = $elapsed;
+
+            if ($attempt < self::MAX_RETRIES) {
+                $delay = self::RETRY_BASE_DELAY * (2 ** ($attempt - 1));
+                \Log::warning('[BEpusdt] 请求失败，准备重试', [
+                    'attempt'    => $attempt,
+                    'max'        => self::MAX_RETRIES,
+                    'elapsed'    => "{$elapsed}s",
+                    'retry_in'   => "{$delay}s",
+                    'url'        => $url,
+                ]);
+                sleep($delay);
+            }
+        }
+
+        \Log::error('[BEpusdt] 已达最大重试次数，请求最终失败', [
+            'max_retries'  => self::MAX_RETRIES,
+            'last_elapsed' => "{$lastError}s",
+            'url'          => $url,
+        ]);
+
+        return null;
+    }
+
+    private function httpPost(string $url, array $data, int $timeout): ?array
     {
         $ch = curl_init();
         curl_setopt_array($ch, [
             CURLOPT_URL            => $url,
             CURLOPT_POST           => true,
             CURLOPT_POSTFIELDS     => json_encode($data),
-            CURLOPT_HTTPHEADER     => ['Content-Type: application/json'],
+            CURLOPT_HTTPHEADER     => ['Content-Type: application/json', 'Accept: application/json'],
             CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_TIMEOUT        => 15,
+            CURLOPT_CONNECTTIMEOUT => self::CONNECT_TIMEOUT,
+            CURLOPT_TIMEOUT        => $timeout,
             CURLOPT_SSL_VERIFYPEER => false,
+            CURLOPT_TCP_KEEPALIVE  => 1,
         ]);
 
         $response = curl_exec($ch);
         $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $totalTime = round(curl_getinfo($ch, CURLINFO_TOTAL_TIME), 2);
 
         if (curl_errno($ch)) {
             \Log::error('[BEpusdt] HTTP 请求失败', [
-                'url'   => $url,
-                'error' => curl_error($ch),
+                'url'     => $url,
+                'error'   => curl_error($ch),
+                'errno'   => curl_errno($ch),
+                'elapsed' => "{$totalTime}s",
             ]);
             curl_close($ch);
             return null;
@@ -212,7 +270,11 @@ class Plugin extends AbstractPlugin implements PaymentInterface
 
         $result = json_decode($response, true);
         if (!is_array($result)) {
-            \Log::error('[BEpusdt] 响应解析失败', ['response' => $response, 'http_code' => $httpCode]);
+            \Log::error('[BEpusdt] 响应解析失败', [
+                'response'  => mb_substr((string) $response, 0, 500),
+                'http_code' => $httpCode,
+                'elapsed'   => "{$totalTime}s",
+            ]);
             return null;
         }
 
