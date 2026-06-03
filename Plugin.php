@@ -72,6 +72,10 @@ class Plugin extends AbstractPlugin implements PaymentInterface
         $tradeType = $this->getConfig('trade_type');
         $timeout   = max(10, (int) $this->getConfig('timeout', self::DEFAULT_TIMEOUT));
 
+        // notify_url 由框架 PaymentService::pay() 计算，且会优先采用 Payment.notify_domain
+        // 列的值（管理后台支付方式的"通知域名"字段），用于前后端域名分离场景。
+        $notifyUrl = $order['notify_url'] ?? '';
+
         $amount = $order['total_amount'] / 100;
 
         $endpoint = $tradeType ? '/api/v1/order/create-transaction' : '/api/v1/order/create-order';
@@ -79,7 +83,7 @@ class Plugin extends AbstractPlugin implements PaymentInterface
         $params = [
             'order_id'     => $order['trade_no'],
             'amount'       => $amount,
-            'notify_url'   => $order['notify_url'],
+            'notify_url'   => $notifyUrl,
             'redirect_url' => $order['return_url'],
             'fiat'         => $fiat,
             'name'         => 'Xboard - ' . $order['trade_no'],
@@ -104,6 +108,11 @@ class Plugin extends AbstractPlugin implements PaymentInterface
             throw new \App\Exceptions\ApiException('BEpusdt 未返回支付链接');
         }
 
+        \Log::info('[BEpusdt] 订单创建成功', [
+            'trade_no'   => $order['trade_no'],
+            'notify_url' => $notifyUrl,
+        ]);
+
         return [
             'type' => 1,
             'data' => $paymentUrl,
@@ -117,16 +126,36 @@ class Plugin extends AbstractPlugin implements PaymentInterface
     {
         $apiToken = $this->getConfig('api_token');
 
+        // 兜底：若控制器传入的 $params 为空（例如 Content-Type 异常导致 $request->input() 失效），
+        // 回退到 raw body 自行解析，保证回调最大可能落地。
+        if (!is_array($params) || empty($params)) {
+            $raw = '';
+            try {
+                $raw = (string) request()->getContent();
+            } catch (\Throwable $e) {
+                // ignore
+            }
+            $decoded = $raw !== '' ? json_decode($raw, true) : null;
+            if (is_array($decoded) && !empty($decoded)) {
+                $params = $decoded;
+                \Log::warning('[BEpusdt] $params 为空，已回退解析 raw body', [
+                    'raw_preview' => mb_substr($raw, 0, 500),
+                ]);
+            }
+        }
+
+        $ctx = $this->collectCallbackContext($params);
+
         if (empty($params['signature'])) {
-            \Log::warning('[BEpusdt] 回调缺少签名');
+            \Log::warning('[BEpusdt] 回调缺少签名', $ctx);
             return false;
         }
 
-        $receivedSign = $params['signature'];
+        $receivedSign = (string) $params['signature'];
         $expectSign   = $this->sign($params, $apiToken);
 
-        if ($receivedSign !== $expectSign) {
-            \Log::warning('[BEpusdt] 签名验证失败', [
+        if (!hash_equals($expectSign, $receivedSign)) {
+            \Log::warning('[BEpusdt] 签名验证失败', $ctx + [
                 'received' => $receivedSign,
                 'expected' => $expectSign,
             ]);
@@ -135,22 +164,42 @@ class Plugin extends AbstractPlugin implements PaymentInterface
 
         $status = (int) ($params['status'] ?? 0);
         if ($status !== 2) {
-            \Log::info('[BEpusdt] 订单状态非成功', ['status' => $status, 'order_id' => $params['order_id'] ?? '']);
+            // BEpusdt Go 端目前只在成功时主动推送，status≠2 实际不会到达；
+            // 保留分支以防协议变化，但降到 debug 避免日志噪音。
+            \Log::debug('[BEpusdt] 订单状态非成功', $ctx + ['status' => $status]);
             return false;
         }
 
-        \Log::info('[BEpusdt] 支付成功回调', [
-            'order_id'  => $params['order_id'],
-            'trade_id'  => $params['trade_id'],
-            'amount'    => $params['amount'],
-            'actual'    => $params['actual_amount'],
-            'tx_hash'   => $params['block_transaction_id'] ?? '',
+        \Log::info('[BEpusdt] 支付成功回调', $ctx + [
+            'amount'  => $params['amount']        ?? null,
+            'actual'  => $params['actual_amount'] ?? null,
+            'tx_hash' => $params['block_transaction_id'] ?? '',
         ]);
 
         return [
-            'trade_no'      => $params['order_id'],
-            'callback_no'   => $params['trade_id'],
+            'trade_no'      => (string) ($params['order_id'] ?? ''),
+            'callback_no'   => (string) ($params['trade_id'] ?? ($params['block_transaction_id'] ?? '')),
             'custom_result' => 'success',
+        ];
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  内部辅助
+    // ═══════════════════════════════════════════════════════════
+
+    private function collectCallbackContext(array $params): array
+    {
+        $req = null;
+        try {
+            $req = request();
+        } catch (\Throwable $e) {
+            // ignore
+        }
+        return [
+            'ip'       => $req?->ip(),
+            'ua'       => $req?->userAgent(),
+            'order_id' => $params['order_id'] ?? null,
+            'trade_id' => $params['trade_id'] ?? null,
         ];
     }
 
@@ -172,10 +221,11 @@ class Plugin extends AbstractPlugin implements PaymentInterface
         foreach ($params as $key => $value) {
             if ($key === 'signature') continue;
             if ($value === null || $value === '') continue;
+            if (is_array($value)) continue; // 防御：嵌套结构不参与签名
             $filtered[$key] = $value;
         }
 
-        ksort($filtered);
+        ksort($filtered, SORT_STRING);
 
         $str = '';
         foreach ($filtered as $key => $value) {
@@ -215,15 +265,17 @@ class Plugin extends AbstractPlugin implements PaymentInterface
             $lastError = $elapsed;
 
             if ($attempt < self::MAX_RETRIES) {
-                $delay = self::RETRY_BASE_DELAY * (2 ** ($attempt - 1));
+                $delaySec = self::RETRY_BASE_DELAY * (2 ** ($attempt - 1));
+                // 上限 3 秒避免在 Octane 下长时间阻塞 worker
+                $delaySec = min($delaySec, 3);
                 \Log::warning('[BEpusdt] 请求失败，准备重试', [
                     'attempt'    => $attempt,
                     'max'        => self::MAX_RETRIES,
                     'elapsed'    => "{$elapsed}s",
-                    'retry_in'   => "{$delay}s",
+                    'retry_in'   => "{$delaySec}s",
                     'url'        => $url,
                 ]);
-                sleep($delay);
+                usleep((int) ($delaySec * 1_000_000));
             }
         }
 
