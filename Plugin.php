@@ -7,10 +7,17 @@ use App\Services\Plugin\AbstractPlugin;
 
 class Plugin extends AbstractPlugin implements PaymentInterface
 {
-    private const MAX_RETRIES       = 3;
+    // 超时与重试是「同步阻塞在用户 checkout 请求里」的：最坏等待 ≈ timeout×retries+退避。
+    // 30s×3 次曾让用户干等 90 秒后误以为支付挂了而取消订单，钱却打到已取消订单的收款
+    // 会话上（2026-07-14 事故）。15s×2 次把最坏等待压到 ~33s，网关慢时尽快明确报错让
+    // 用户重试，而不是让他自己去点取消。
+    private const MAX_RETRIES       = 2;
     private const RETRY_BASE_DELAY  = 1;
-    private const DEFAULT_TIMEOUT   = 30;
+    private const DEFAULT_TIMEOUT   = 15;
     private const CONNECT_TIMEOUT   = 10;
+
+    /** 网关 trade_id 的缓存 TTL：迟到支付人工核对/对账/撤单都可能用到，保留 24h。 */
+    private const TRADE_ID_CACHE_TTL = 86400;
 
     public function boot(): void
     {
@@ -55,8 +62,8 @@ class Plugin extends AbstractPlugin implements PaymentInterface
             'timeout' => [
                 'label'       => '请求超时（秒）',
                 'type'        => 'string',
-                'default'     => '30',
-                'description' => 'HTTP 请求超时时间，默认 30 秒',
+                'default'     => '15',
+                'description' => 'HTTP 请求超时时间，默认 15 秒（同步阻塞在用户支付请求里，不宜过长）',
             ],
         ];
     }
@@ -108,8 +115,20 @@ class Plugin extends AbstractPlugin implements PaymentInterface
             throw new \App\Exceptions\ApiException('BEpusdt 未返回支付链接');
         }
 
+        // 记住网关侧 trade_id：迟到支付人工核对、对账、必要时调 cancel-transaction 撤单
+        // 都需要它，而回调之外没有别的途径再拿到（网关按 order_id 复建会话时 trade_id 不变）。
+        $gatewayTradeId = (string) ($response['data']['trade_id'] ?? '');
+        if ($gatewayTradeId !== '') {
+            try {
+                \Cache::put('bepusdt:trade_id:' . $order['trade_no'], $gatewayTradeId, self::TRADE_ID_CACHE_TTL);
+            } catch (\Throwable $e) {
+                // 缓存不可用不影响支付主流程
+            }
+        }
+
         \Log::info('[BEpusdt] 订单创建成功', [
             'trade_no'   => $order['trade_no'],
+            'trade_id'   => $gatewayTradeId,
             'notify_url' => $notifyUrl,
         ]);
 
@@ -176,9 +195,27 @@ class Plugin extends AbstractPlugin implements PaymentInterface
             'tx_hash' => $params['block_transaction_id'] ?? '',
         ]);
 
+        $tradeNo = (string) ($params['order_id'] ?? '');
+        // 回调里的 amount 是创建支付时下发的法币金额（已纳入签名，不可被篡改），单位元。
+        $paidAmount = (int) round(((float) ($params['amount'] ?? 0)) * 100);
+
+        // 金额绑定（防欠额开通）：核心订单在此自校验"实付法币额 ≥ 订单应付额"。
+        // 充值订单不在 v2_order 表（由 RechargeNotifyController 用下方返回的 paid_amount 自行校验），此处查不到即跳过。
+        if ($tradeNo !== '' && $paidAmount > 0) {
+            $order = \App\Models\Order::where('trade_no', $tradeNo)->first();
+            if ($order && $paidAmount < (int) $order->total_amount) {
+                \Log::error('[BEpusdt] 实付金额低于订单应付额，拒绝开通', $ctx + [
+                    'paid_amount'  => $paidAmount,
+                    'order_amount' => (int) $order->total_amount,
+                ]);
+                return false;
+            }
+        }
+
         return [
-            'trade_no'      => (string) ($params['order_id'] ?? ''),
+            'trade_no'      => $tradeNo,
             'callback_no'   => (string) ($params['trade_id'] ?? ($params['block_transaction_id'] ?? '')),
+            'paid_amount'   => $paidAmount,
             'custom_result' => 'success',
         ];
     }
