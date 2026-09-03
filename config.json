@@ -1,7 +1,7 @@
 {
     "name": "BEpusdt 加密货币支付",
     "code": "bepusdt",
-    "version": "1.2.0",
+    "version": "1.2.1",
     "description": "对接 BEpusdt 加密货币收款网关，支持 USDT/USDC/TRX 等多币种多链收款，动态汇率，自动回调。支持前后端域名分离场景。",
     "author": "Xboard",
     "type": "payment",

@@ -19,6 +19,15 @@ class Plugin extends AbstractPlugin implements PaymentInterface
     /** 网关 trade_id 的缓存 TTL：迟到支付人工核对/对账/撤单都可能用到，保留 24h。 */
     private const TRADE_ID_CACHE_TTL = 86400;
 
+    /**
+     * 会话复用的安全余量（秒）：距网关自报的会话到期时间不足这么久时，宁可重建也不复用，
+     * 避免把一条即将失效的支付链接发给用户。
+     */
+    private const SESSION_REUSE_MARGIN = 60;
+
+    /** 网关未返回 expiration_time 时的保守会话时长（秒）。 */
+    private const SESSION_FALLBACK_TTL = 600;
+
     public function boot(): void
     {
         $this->filter('available_payment_methods', function ($methods) {
@@ -85,6 +94,31 @@ class Plugin extends AbstractPlugin implements PaymentInterface
 
         $amount = $order['total_amount'] / 100;
 
+        // ── 会话复用 ─────────────────────────────────────────────────────────────
+        // 支付页会以数秒一次的频率反复调用 checkout，使同一订单在网关侧被反复重建会话
+        // （2026-09-03 实测：单个订单 18 分钟内触发 155 次 create-order）。
+        // BEpusdt 按「会话开始之后到账」匹配转账，会话每重建一次，匹配窗口起点就往后挪一次，
+        // 用户早先付的那笔便永远落在窗口之前 —— 于是网关收了钱、40 秒内归集了钱，订单却
+        // 一直停在待支付，20 分钟后按过期取消（工单 #2625 实证，用户 10.899 USDT 被吞）。
+        // 因此在网关自报的 expiration_time 有效期内复用已有会话，不再重复创建。
+        $sessionKey = 'bepusdt:session:' . $order['trade_no'];
+        try {
+            $cached = \Cache::get($sessionKey);
+            if (is_array($cached)
+                && !empty($cached['payment_url'])
+                && ((int) ($cached['expires_at'] ?? 0)) - self::SESSION_REUSE_MARGIN > time()
+            ) {
+                \Log::info('[BEpusdt] 复用未过期的支付会话', [
+                    'trade_no'   => $order['trade_no'],
+                    'trade_id'   => $cached['trade_id'] ?? '',
+                    'expires_in' => (int) $cached['expires_at'] - time(),
+                ]);
+                return ['type' => 1, 'data' => $cached['payment_url']];
+            }
+        } catch (\Throwable $e) {
+            // 缓存不可用时退回正常创建流程，不影响支付
+        }
+
         $endpoint = $tradeType ? '/api/v1/order/create-transaction' : '/api/v1/order/create-order';
 
         $params = [
@@ -126,10 +160,27 @@ class Plugin extends AbstractPlugin implements PaymentInterface
             }
         }
 
+        // 缓存整个会话供上面的复用分支使用。TTL 取网关自报的 expiration_time（实测 1199s），
+        // 缺失或异常时回退到保守值 —— 宁可多建一次会话，也不能把已失效的链接发给用户。
+        $expiresIn = (int) ($response['data']['expiration_time'] ?? 0);
+        if ($expiresIn <= 0 || $expiresIn > 3600) {
+            $expiresIn = self::SESSION_FALLBACK_TTL;
+        }
+        try {
+            \Cache::put($sessionKey, [
+                'payment_url' => $paymentUrl,
+                'trade_id'    => $gatewayTradeId,
+                'expires_at'  => time() + $expiresIn,
+            ], $expiresIn);
+        } catch (\Throwable $e) {
+            // 缓存不可用不影响支付主流程
+        }
+
         \Log::info('[BEpusdt] 订单创建成功', [
             'trade_no'   => $order['trade_no'],
             'trade_id'   => $gatewayTradeId,
             'notify_url' => $notifyUrl,
+            'expires_in' => $expiresIn,
         ]);
 
         return [
