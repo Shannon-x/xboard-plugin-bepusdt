@@ -4,6 +4,7 @@ namespace Plugin\Bepusdt;
 
 use App\Contracts\PaymentInterface;
 use App\Services\Plugin\AbstractPlugin;
+use Plugin\PaymentAttempt\Support\Attempts;
 
 class Plugin extends AbstractPlugin implements PaymentInterface
 {
@@ -127,7 +128,7 @@ class Plugin extends AbstractPlugin implements PaymentInterface
             'notify_url'   => $notifyUrl,
             'redirect_url' => $order['return_url'],
             'fiat'         => $fiat,
-            'name'         => 'Xboard - ' . $order['trade_no'],
+            'name'         => '软件服务费 - ' . $order['trade_no'],
         ];
 
         if ($tradeType) {
@@ -246,29 +247,94 @@ class Plugin extends AbstractPlugin implements PaymentInterface
             'tx_hash' => $params['block_transaction_id'] ?? '',
         ]);
 
-        $tradeNo = (string) ($params['order_id'] ?? '');
+        // order_id 可能是「支付会话号」而不是订单号（见 PaymentAttempt 插件）：会话号让
+        // 用户可以退出来换别的支付方式，且每条会话在网关侧是独立的收款会话 —— 这一点对
+        // BEpusdt 尤其重要，它按「会话开始之后到账」匹配转账，独立会话意味着旧会话的匹配
+        // 窗口不会被新会话往后挪（2026-09-03 那类「收了钱却永远匹配不上」的事故形态）。
+        $sessionRef = (string) ($params['order_id'] ?? '');
+        $callbackNo = (string) ($params['trade_id'] ?? ($params['block_transaction_id'] ?? ''));
         // 回调里的 amount 是创建支付时下发的法币金额（已纳入签名，不可被篡改），单位元。
         $paidAmount = (int) round(((float) ($params['amount'] ?? 0)) * 100);
 
-        // 金额绑定（防欠额开通）：核心订单在此自校验"实付法币额 ≥ 订单应付额"。
-        // 充值订单不在 v2_order 表（由 RechargeNotifyController 用下方返回的 paid_amount 自行校验），此处查不到即跳过。
-        if ($tradeNo !== '' && $paidAmount > 0) {
-            $order = \App\Models\Order::where('trade_no', $tradeNo)->first();
-            if ($order && $paidAmount < (int) $order->total_amount) {
-                \Log::error('[BEpusdt] 实付金额低于订单应付额，拒绝开通', $ctx + [
-                    'paid_amount'  => $paidAmount,
-                    'order_amount' => (int) $order->total_amount,
+        // 金额绑定（防欠额开通）：自校验「实付法币额 ≥ 本次发起支付时报给网关的应付额」。
+        //
+        // 期望值优先取支付会话上冻结的 expected_amount：用户切换过支付方式后订单上的
+        // handling_amount 已是新通道的口径，拿它校验旧通道的合法回调会误判成欠额。
+        // 没有会话（启用会话之前下的单）时退回按订单号查 v2_order 的老口径。
+        // 充值订单不在 v2_order 表（由 RechargeNotifyController 用下方返回的 paid_amount
+        // 自行校验），两边都查不到即跳过。
+        if ($sessionRef !== '' && $paidAmount > 0) {
+            $expected = class_exists(Attempts::class)
+                ? Attempts::expectedAmountFor($sessionRef)
+                : null;
+            if ($expected === null) {
+                $order = \App\Models\Order::where('trade_no', $sessionRef)->first();
+                $expected = $order ? (int) $order->total_amount : null;
+            }
+            if ($expected !== null && $paidAmount < $expected) {
+                \Log::error('[BEpusdt] 实付金额低于应付额，拒绝开通', $ctx + [
+                    'paid_amount'     => $paidAmount,
+                    'expected_amount' => $expected,
                 ]);
                 return false;
             }
         }
 
+        $claim = $this->claimPaymentAttempt($sessionRef, $callbackNo, $paidAmount);
+        if ($claim !== null) {
+            return $claim;
+        }
+
         return [
-            'trade_no'      => $tradeNo,
-            'callback_no'   => (string) ($params['trade_id'] ?? ($params['block_transaction_id'] ?? '')),
+            'trade_no'      => $sessionRef,
+            'callback_no'   => $callbackNo,
             'paid_amount'   => $paidAmount,
             'custom_result' => 'success',
         ];
+    }
+
+    /**
+     * 交给支付会话层认领本次回调。
+     *
+     * 必须在**验签通过之后**调用：会话层不做验签，它假定调用方已经证明这条回调确实
+     * 来自本条支付配置。
+     *
+     * @return array|bool|null 非 null 即为 notify() 的最终返回值；
+     *                         null 表示「这不是会话号」，按普通订单号继续。
+     */
+    private function claimPaymentAttempt(string $sessionRef, string $callbackNo, int $paidAmount): array|bool|null
+    {
+        if (!class_exists(Attempts::class)) {
+            return null;
+        }
+
+        $claim = Attempts::claim(
+            $sessionRef,
+            (int) $this->getConfig('id'),
+            $callbackNo,
+            $paidAmount > 0 ? $paidAmount : null
+        );
+
+        switch ($claim['outcome'] ?? Attempts::OUTCOME_UNKNOWN) {
+            case Attempts::OUTCOME_OK:
+                return [
+                    'trade_no'      => (string) $claim['trade_no'],
+                    'callback_no'   => $callbackNo,
+                    'paid_amount'   => $paidAmount,
+                    // 会话号原样带回去：核心 PaymentController 用不到会忽略它，而拥有
+                    // 自有单据表的插件（余额充值）需要它来复核网关绑定与应付额。
+                    'attempt_ref'   => $sessionRef,
+                    'custom_result' => 'success',
+                ];
+            case Attempts::OUTCOME_REJECT:
+                return false;
+            case Attempts::OUTCOME_REFUNDED:
+            case Attempts::OUTCOME_MANUAL:
+                // 已由会话层处置（退余额或告警转人工）。ACK 让网关停止重投，但不开单。
+                return ['acknowledge' => true, 'custom_result' => 'success'];
+            default:
+                return null;
+        }
     }
 
     // ═══════════════════════════════════════════════════════════
