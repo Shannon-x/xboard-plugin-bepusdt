@@ -128,7 +128,7 @@ class Plugin extends AbstractPlugin implements PaymentInterface
             'notify_url'   => $notifyUrl,
             'redirect_url' => $order['return_url'],
             'fiat'         => $fiat,
-            'name'         => 'Xboard - ' . $order['trade_no'],
+            'name'         => '软件服务费 - ' . $order['trade_no'],
         ];
 
         if ($tradeType) {
