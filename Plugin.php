@@ -234,9 +234,15 @@ class Plugin extends AbstractPlugin implements PaymentInterface
         }
 
         $status = (int) ($params['status'] ?? 0);
+        if ($status === 3) {
+            // 会话过期是终态，之后不会再有转账匹配到这一单。回 200 让网关停止重投
+            // （原先回 422，网关会一直重试，核心日志里全是误导性的「verify failed」）。
+            \Log::info('[BEpusdt] 会话过期通知，已确认', $ctx + ['status' => $status]);
+            return ['acknowledge' => true, 'custom_result' => 'success'];
+        }
         if ($status !== 2) {
-            // BEpusdt Go 端目前只在成功时主动推送，status≠2 实际不会到达；
-            // 保留分支以防协议变化，但降到 debug 避免日志噪音。
+            // 网关在会话创建后会推 status=1（等待支付，未选链、无金额），我们不确认时它会重试到过期。
+            // 不确认是有意的：网关是私有构建，无法确定确认 status=1 后它是否还会推送随后的 status=2。
             \Log::debug('[BEpusdt] 订单状态非成功', $ctx + ['status' => $status]);
             return false;
         }
